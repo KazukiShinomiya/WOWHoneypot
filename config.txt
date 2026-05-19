@@ -31,3 +31,8 @@ huntlog=hunting.log
 
 # for GDPR(True: replace source ip address with 0.0.0.0)
 ipmasking=False
+
+# HTTPS (requires certfile and keyfile when enabled)
+https_enable=False
+https_certfile=./ssl/cert.pem
+https_keyfile=./ssl/key.pem

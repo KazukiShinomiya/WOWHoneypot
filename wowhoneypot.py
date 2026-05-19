@@ -6,6 +6,7 @@
 
 import os
 import sys
+import ssl
 import traceback
 import threading
 import re
@@ -43,6 +44,9 @@ timeout = 3.0
 blocklist = {}
 separator = " "
 ipmasking = False
+https_enable = False
+https_certfile = ""
+https_keyfile = ""
 
 class WOWHoneypotHTTPServer(HTTPServer):
     def server_bind(self):
@@ -190,9 +194,9 @@ class WOWHoneypotRequestHandler(BaseHTTPRequestHandler):
                 else:
                     hostname = self.headers["host"].split(" ")[0]
                 if hostname.find(":") == -1:
-                    hostname = hostname + ":80"
+                    hostname = hostname + (":443" if https_enable else ":80")
             else:
-                hostname = "blank:80"
+                hostname = "blank:443" if https_enable else "blank:80"
 
             request_all = self.requestline + "\n" + str(self.headers) + body
             logging_access("[{time}]{s}{clientip}{s}{hostname}{s}\"{requestline}\"{s}{status_code}{s}{match_result}{s}{requestall}\n".format(
@@ -326,6 +330,15 @@ def config_load():
                     ipmasking = True
                 else:
                     ipmasking = False
+            if line.startswith("https_enable"):
+                global https_enable
+                https_enable = line.split('=')[1].strip() == "True"
+            if line.startswith("https_certfile"):
+                global https_certfile
+                https_certfile = line.split('=')[1].strip()
+            if line.startswith("https_keyfile"):
+                global https_keyfile
+                https_keyfile = line.split('=')[1].strip()
 
         global accesslogfile
         accesslogfile = os.path.join(logpath, accesslogfile_name)
@@ -335,6 +348,12 @@ def config_load():
 
         global huntrulelogfile
         huntrulelogfile = os.path.join(logpath, huntlog_name)
+
+    if https_enable:
+        if not os.path.exists(https_certfile):
+            logging_system("https_certfile({0}) not found.".format(https_certfile), True, True)
+        if not os.path.exists(https_keyfile):
+            logging_system("https_keyfile({0}) not found.".format(https_keyfile), True, True)
 
     # art directory Load
     if not os.path.exists(artpath) or not os.path.isdir(artpath):
@@ -427,6 +446,11 @@ if __name__ == '__main__':
     logging_system("IP Masking: {0}".format(ipmasking), False, False)
     myServer = WOWHoneypotHTTPServer((ip, port), WOWHoneypotRequestHandler)
     myServer.timeout = timeout
+    if https_enable:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(https_certfile, https_keyfile)
+        myServer.socket = context.wrap_socket(myServer.socket, server_side=True)
+        logging_system("HTTPS enabled. cert={0}".format(https_certfile), False, False)
     try:
         myServer.serve_forever()
     except KeyboardInterrupt:
