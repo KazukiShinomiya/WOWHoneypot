@@ -19,6 +19,7 @@ import socket
 import select
 import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from mrr_checker import parse_mrr
 from datetime import datetime, timedelta, timezone
 
@@ -48,13 +49,39 @@ https_enable = False
 https_certfile = ""
 https_keyfile = ""
 
-class WOWHoneypotHTTPServer(HTTPServer):
+class WOWHoneypotHTTPServer(ThreadingMixIn, HTTPServer):
+    # One thread per connection, so a silent client cannot stall the others.
+    # Connections beyond max_handlers are closed immediately.
+    # The default listen backlog (5) drops SYNs when scanners burst in.
+    daemon_threads = True
+    max_handlers = 64
+    request_queue_size = 128
+
     def server_bind(self):
         HTTPServer.server_bind(self)
         self.socket.settimeout(timeout)
+        self.handler_slots = threading.BoundedSemaphore(self.max_handlers)
+
+    def process_request(self, request, client_address):
+        if not self.handler_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        ThreadingMixIn.process_request(self, request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            ThreadingMixIn.process_request_thread(self, request, client_address)
+        finally:
+            self.handler_slots.release()
 
     def finish_request(self, request, client_address):
         request.settimeout(timeout)
+        # TLS handshake runs here under the timeout, not inside accept() without one.
+        if isinstance(request, ssl.SSLSocket):
+            try:
+                request.do_handshake()
+            except (ssl.SSLError, OSError):
+                return
         HTTPServer.finish_request(self, request, client_address)
 
 class WOWHoneypotRequestHandler(BaseHTTPRequestHandler):
@@ -434,7 +461,8 @@ def config_load():
 
 
 if __name__ == '__main__':
-    random.seed(datetime.now())
+    # Python 3.11+ rejects a datetime seed
+    random.seed()
 
     try:
         config_load()
@@ -449,7 +477,8 @@ if __name__ == '__main__':
     if https_enable:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(https_certfile, https_keyfile)
-        myServer.socket = context.wrap_socket(myServer.socket, server_side=True)
+        myServer.socket = context.wrap_socket(myServer.socket, server_side=True,
+                                              do_handshake_on_connect=False)
         logging_system("HTTPS enabled. cert={0}".format(https_certfile), False, False)
     try:
         myServer.serve_forever()
