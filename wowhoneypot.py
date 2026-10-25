@@ -17,6 +17,7 @@ import logging
 import logging.handlers
 import socket
 import select
+import time
 import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -42,6 +43,7 @@ default_content = []
 mrrdata = {}
 mrrids = []
 timeout = 3.0
+max_body_size = 1024 * 1024
 blocklist = {}
 separator = " "
 ipmasking = False
@@ -92,6 +94,32 @@ class WOWHoneypotRequestHandler(BaseHTTPRequestHandler):
         self.error_message_format = "error"
         self.error_content_type = "text/plain"
 
+    def read_body(self, content_length):
+        # Content-Length comes from the client: tolerate garbage, cap the size,
+        # and keep whatever arrived if the client stops sending.
+        try:
+            length = int(content_length)
+        except ValueError:
+            return ""
+        if length > max_body_size:
+            # The rest is left unread, so it must not be parsed as the next request.
+            self.close_connection = True
+        remaining = min(length, max_body_size)
+        deadline = time.monotonic() + timeout
+        chunks = []
+        while remaining > 0 and time.monotonic() < deadline:
+            try:
+                chunk = self.rfile.read1(min(remaining, 65536))
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if remaining > 0:
+            self.close_connection = True
+        return b"".join(chunks).decode("utf-8", errors="replace")
+
     def handle_one_request(self):
         if ipmasking == True:
             clientip = "0.0.0.0"
@@ -133,10 +161,7 @@ class WOWHoneypotRequestHandler(BaseHTTPRequestHandler):
 
             body = ""
             if 'content-length' in self.headers:
-                content_len = int(self.headers['content-length'])
-                if content_len > 0:
-                    post_body = self.rfile.read(content_len)
-                    body = post_body.decode()
+                body = self.read_body(self.headers['content-length'])
 
             match = False
             for id in mrrids:
