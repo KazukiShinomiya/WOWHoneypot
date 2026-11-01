@@ -16,7 +16,6 @@ import binascii
 import logging
 import logging.handlers
 import socket
-import select
 import time
 import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -63,10 +62,21 @@ class WOWHoneypotHTTPServer(ThreadingMixIn, HTTPServer):
         HTTPServer.server_bind(self)
         self.socket.settimeout(timeout)
         self.handler_slots = threading.BoundedSemaphore(self.max_handlers)
+        self.dropped = 0
+        self.dropped_logged_at = 0.0
 
     def process_request(self, request, client_address):
         if not self.handler_slots.acquire(blocking=False):
             self.shutdown_request(request)
+            # Count drops so a too-small max_handlers is visible, at most one line a minute.
+            # Only the serve_forever thread runs this, so no lock is needed.
+            self.dropped += 1
+            now = time.monotonic()
+            if now - self.dropped_logged_at >= 60:
+                logging_system("Handler limit({0}) reached. {1} connection(s) dropped.".format(
+                    self.max_handlers, self.dropped), True, False)
+                self.dropped = 0
+                self.dropped_logged_at = now
             return
         ThreadingMixIn.process_request(self, request, client_address)
 
@@ -131,12 +141,15 @@ class WOWHoneypotRequestHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
         try:
-            (r, w, e) = select.select([self.rfile], [], [], timeout)
-            if len(r) == 0:
+            # Wait for the first byte with peek(), not select(): select() looks only
+            # at the socket and misses a pipelined request that rfile has already buffered.
+            # The socket timeout bounds the wait.
+            try:
+                self.rfile.peek(1)
+            except socket.timeout:
                 errmsg = "Client({0}) data sending was too late.".format(clientip)
                 raise socket.timeout(errmsg)
-            else:
-                self.raw_requestline = self.rfile.readline(65537)
+            self.raw_requestline = self.rfile.readline(65537)
             if not self.raw_requestline:
                 self.close_connection = True
                 return
@@ -199,45 +212,10 @@ class WOWHoneypotRequestHandler(BaseHTTPRequestHandler):
                     continue
                 match = id
 
-            status = 200
-            tmp = self.requestline.split()
-            if len(tmp) == 3:
-                self.protocol_version = "{0}".format(tmp[2].strip())
-            else:
-                self.protocol_version = "HTTP/1.1"
+            status = mrrdata[match]["response"]["status"] if match else 200
 
-            if not match:
-                self.send_response(200)
-                self.send_header("Server", serverheader)
-                self.send_header('Content-Type', 'text/html')
-                r = default_content[random.randint(0, len(default_content)-1)]
-                self.send_header('Content-Length', len(r))
-                self.end_headers()
-                self.wfile.write(bytes(r, "utf-8"))
-            else:
-                status = mrrdata[match]["response"]["status"]
-                self.send_response(status)
-                header_server_flag = False
-                header_content_type_flag = False
-                for name, value in mrrdata[match]["response"]["header"].items():
-                    self.send_header(name, value)
-                    if name == "Server":
-                        header_server_flag = True
-                    elif name == "Content-Type":
-                        header_content_type_flag = True
-
-                if not header_server_flag:
-                    self.send_header('Server', serverheader)
-                if not header_content_type_flag:
-                    self.send_header('Content-Type', 'text/html')
-                r = mrrdata[match]["response"]["body"]
-                self.send_header('Content-Length', len(r))
-                self.end_headers()
-                self.wfile.write(bytes(r, "utf-8"))
-
-            self.wfile.flush()
-
-            # logging
+            # Log before responding: a client that disconnects without reading
+            # the response must still leave its request in access_log.
             hostname = None
             if "host" in self.headers:
 
@@ -269,6 +247,46 @@ class WOWHoneypotRequestHandler(BaseHTTPRequestHandler):
                         logging_hunt("[{time}] {clientip} {hit}\n".format(    time=get_time(),
                                                                             clientip=clientip,
                                                                             hit=hit))
+
+            tmp = self.requestline.split()
+            if len(tmp) == 3:
+                self.protocol_version = "{0}".format(tmp[2].strip())
+            else:
+                self.protocol_version = "HTTP/1.1"
+
+            if not match:
+                self.send_response(200)
+                self.send_header("Server", serverheader)
+                self.send_header('Content-Type', 'text/html')
+                r = default_content[random.randint(0, len(default_content)-1)]
+            else:
+                self.send_response(status)
+                header_server_flag = False
+                header_content_type_flag = False
+                for name, value in mrrdata[match]["response"]["header"].items():
+                    self.send_header(name, value)
+                    if name == "Server":
+                        header_server_flag = True
+                    elif name == "Content-Type":
+                        header_content_type_flag = True
+
+                if not header_server_flag:
+                    self.send_header('Server', serverheader)
+                if not header_content_type_flag:
+                    self.send_header('Content-Type', 'text/html')
+                r = mrrdata[match]["response"]["body"]
+            r = bytes(r, "utf-8")
+            # Content-Length counts bytes, not characters.
+            self.send_header('Content-Length', len(r))
+            try:
+                self.end_headers()
+                self.wfile.write(r)
+                self.wfile.flush()
+            except OSError:
+                # The request is already logged. A client that left without
+                # reading the response is not a failure for the blocklist.
+                self.close_connection = True
+                return
 
         except socket.timeout as e:
             emsg = "{0}".format(e)
@@ -346,6 +364,7 @@ def config_load():
                 global port
                 port = int(line.split('=')[1].strip())
             if line.startswith("artpath"):
+                global artpath
                 artpath = line.split('=')[1].strip()
             if line.startswith("logpath"):
                 logpath = line.split('=')[1].strip()
@@ -409,7 +428,7 @@ def config_load():
 
     # art directory Load
     if not os.path.exists(artpath) or not os.path.isdir(artpath):
-        logging_system("{0} directory load error.".format(arttpath), True, True)
+        logging_system("{0} directory load error.".format(artpath), True, True)
 
     defaultfile = os.path.join(artpath, "mrrules.xml")
     if not os.path.exists(defaultfile) or not os.path.isfile(defaultfile):
